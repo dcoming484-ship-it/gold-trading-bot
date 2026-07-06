@@ -1,7 +1,692 @@
-requirements.txt
+main.py
 
-requests>=2.31.0
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.24.0
-flask>=3.0.0
+"""
+Elite Algorithmic Gold Trading System
+Multi-Timeframe | Quantitative Risk Management | Sentiment-Tech Convergence | Economic Calendar
+
+Environment Variables (required for deployment outside Replit):
+  OPENROUTER_API_KEY  — your OpenRouter API key
+  TELEGRAM_TOKEN      — your Telegram bot token
+  TELEGRAM_CHAT_ID    — default Telegram chat ID to send signals to
+  PORT                — port for the keep-alive web server (default: 5000)
+
+Optional:
+  ACCOUNT_SIZE        — notional account in USD (default: 10000)
+  TICKER              — yfinance ticker symbol (default: GC=F)
+"""
+
+import os
+import time
+import logging
+import threading
+from datetime import datetime, timezone, timedelta
+
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+from flask import Flask
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("GoldBot")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  (env vars → hard fallbacks for Replit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+OPENROUTER_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY",
+    "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",
+)
+TELEGRAM_TOKEN = os.environ.get(
+    "TELEGRAM_TOKEN",
+    "8867938855:AAFeBOBvAsPX2q2nFMnKken2KhDtNguId2g",
+)
+CHAT_ID      = os.environ.get("TELEGRAM_CHAT_ID", "1110360693")
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+TICKER       = os.environ.get("TICKER", "GC=F")
+ACCOUNT_SIZE = int(os.environ.get("ACCOUNT_SIZE", "10000"))
+FLASK_PORT   = int(os.environ.get("PORT", "5000"))
+
+OPENROUTER_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "nousresearch/hermes-3-llama-3.1-405b:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+]
+
+RISK_PCT             = 0.01
+MIN_RR               = 2.0
+ATR_SL_MULT          = 1.5
+CONFLUENCE_THRESHOLD = 0.30
+
+TIMEFRAMES = {
+    "15m": {"period": "5d",   "interval": "15m", "weight": 0.20},
+    "1h":  {"period": "60d",  "interval": "1h",  "weight": 0.30},
+    "1d":  {"period": "200d", "interval": "1d",  "weight": 0.50},
+}
+
+signal_lock = threading.Lock()
+alerts_lock = threading.Lock()
+stats_lock  = threading.Lock()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRICE ALERT STORE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+alerts: dict[str, list] = {}
+_alert_id_counter = 0
+
+
+def _new_alert_id() -> int:
+    global _alert_id_counter
+    _alert_id_counter += 1
+    return _alert_id_counter
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEEKLY SIGNAL TRACKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+weekly_stats: dict = {
+    "signals":    [],
+    "week_start": None,
+}
+
+
+def _current_week_monday() -> str:
+    now = datetime.now(timezone.utc)
+    monday = now - timedelta(days=now.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+
+def record_signal(signal: str, score: float) -> None:
+    week = _current_week_monday()
+    with stats_lock:
+        if weekly_stats["week_start"] != week:
+            weekly_stats["signals"]    = []
+            weekly_stats["week_start"] = week
+        weekly_stats["signals"].append({
+            "signal": signal,
+            "score":  round(score, 3),
+            "ts":     datetime.now(timezone.utc).strftime("%a %H:%M"),
+        })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TECHNICAL INDICATOR CALCULATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def calc_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def calc_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast    = calc_ema(series, fast)
+    ema_slow    = calc_ema(series, slow)
+    macd_line   = ema_fast - ema_slow
+    signal_line = calc_ema(macd_line, signal)
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    hl  = df["High"] - df["Low"]
+    hpc = (df["High"] - df["Close"].shift()).abs()
+    lpc = (df["Low"]  - df["Close"].shift()).abs()
+    tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ema20"]  = calc_ema(df["Close"], 20)
+    df["ema50"]  = calc_ema(df["Close"], 50)
+    df["ema200"] = calc_ema(df["Close"], 200)
+    df["rsi"]    = calc_rsi(df["Close"])
+    df["macd"], df["macd_signal"], df["macd_hist"] = calc_macd(df["Close"])
+    df["atr"]    = calc_atr(df)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATA FETCHING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_timeframe(period: str, interval: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(TICKER, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 30:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        return add_indicators(df)
+    except Exception as e:
+        log.warning(f"[fetch {interval}] {e}")
+        return None
+
+
+def fetch_news() -> str | None:
+    try:
+        gold  = yf.Ticker(TICKER)
+        items = gold.news or []
+        headlines = []
+        for item in items[:7]:
+            content = item.get("content", {})
+            title = (item.get("title") or content.get("title")
+                     or content.get("summary") or "")
+            if title:
+                headlines.append(f"- {title}")
+        return "\n".join(headlines) or None
+    except Exception as e:
+        log.warning(f"[news] {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ECONOMIC CALENDAR  (ForexFactory free JSON feed — no API key required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CALENDAR_KEYWORDS = {
+    "cpi", "consumer price", "inflation",
+    "fomc", "federal open market",
+    "non-farm", "nonfarm", "nfp", "employment change",
+    "federal funds rate", "interest rate decision", "fed rate",
+    "pce", "gdp", "unemployment", "jobless claims",
+    "treasury", "debt ceiling",
+}
+
+_CALENDAR_URLS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+]
+
+
+def _is_high_impact_gold_event(title: str, country: str, impact: str) -> bool:
+    if country.upper() not in ("USD", "US"):
+        return False
+    if impact.lower() != "high":
+        return False
+    return any(kw in title.lower() for kw in _CALENDAR_KEYWORDS)
+
+
+def fetch_economic_calendar() -> list[dict]:
+    events = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GoldBot/1.0)",
+        "Accept":     "application/json",
+    }
+    for url in _CALENDAR_URLS:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if not r.ok:
+                continue
+            for ev in r.json():
+                title   = ev.get("title", "")
+                country = ev.get("country", "")
+                impact  = ev.get("impact", "")
+                if _is_high_impact_gold_event(title, country, impact):
+                    events.append({
+                        "title":    title,
+                        "date":     ev.get("date", ""),
+                        "country":  country,
+                        "impact":   impact,
+                        "forecast": ev.get("forecast") or "—",
+                        "previous": ev.get("previous") or "—",
+                        "actual":   ev.get("actual") or None,
+                    })
+        except Exception as e:
+            log.warning(f"[calendar] {url}: {e}")
+    seen, unique = set(), []
+    for ev in events:
+        key = (ev["title"], ev["date"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(ev)
+    unique.sort(key=lambda x: x["date"])
+    return unique[:10]
+
+
+def format_calendar_for_prompt(events: list[dict]) -> str:
+    if not events:
+        return "لا توجد أحداث اقتصادية كبرى مجدولة هذا الأسبوع."
+    lines = []
+    for ev in events:
+        try:
+            dt  = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            day = dt.strftime("%a %d %b %H:%M UTC")
+        except Exception:
+            day = ev["date"][:16]
+        actual_str = f" | Actual: {ev['actual']}" if ev["actual"] else ""
+        lines.append(
+            f"- {day} | {ev['title']} "
+            f"(Forecast: {ev['forecast']} | Prev: {ev['previous']}{actual_str})"
+        )
+    return "\n".join(lines)
+
+
+def format_calendar_for_telegram(events: list[dict]) -> str:
+    if not events:
+        return "    _لا توجد أحداث اقتصادية كبرى مجدولة._\n"
+    lines = []
+    for ev in events:
+        try:
+            dt  = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            day = dt.strftime("%a %d/%m %H:%M")
+        except Exception:
+            day = ev["date"][:13]
+        actual_tag = f" ✅ *{ev['actual']}*" if ev["actual"] else ""
+        lines.append(
+            f"    🗓 *{day}* — {ev['title']}"
+            f" _(توقع: {ev['forecast']}){actual_tag}_"
+        )
+    return "\n".join(lines) + "\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCORING ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_timeframe(df: pd.DataFrame) -> dict:
+    row  = df.iloc[-1]
+    prev = df.iloc[-2]
+    scores = {}
+
+    rsi = row["rsi"]
+    if rsi >= 70:        scores["rsi"] = -0.8
+    elif rsi <= 30:      scores["rsi"] = +0.8
+    elif rsi > 55:       scores["rsi"] = +0.4
+    elif rsi < 45:       scores["rsi"] = -0.4
+    else:                scores["rsi"] = 0.0
+
+    hist_now  = row["macd_hist"]
+    hist_prev = prev["macd_hist"]
+    macd_cross_bull = (prev["macd"] < prev["macd_signal"] and
+                       row["macd"]  > row["macd_signal"])
+    macd_cross_bear = (prev["macd"] > prev["macd_signal"] and
+                       row["macd"]  < row["macd_signal"])
+    if macd_cross_bull:                          scores["macd"] = +1.0
+    elif macd_cross_bear:                        scores["macd"] = -1.0
+    elif hist_now > 0 and hist_now > hist_prev:  scores["macd"] = +0.5
+    elif hist_now < 0 and hist_now < hist_prev:  scores["macd"] = -0.5
+    elif hist_now > 0:                           scores["macd"] = +0.2
+    elif hist_now < 0:                           scores["macd"] = -0.2
+    else:                                        scores["macd"] = 0.0
+
+    price  = row["Close"]
+    ema20  = row["ema20"]
+    ema50  = row["ema50"]
+    ema200 = row["ema200"]
+    if   price > ema20 > ema50 > ema200: scores["ema"] = +1.0
+    elif price > ema20 > ema50:          scores["ema"] = +0.6
+    elif price > ema20:                  scores["ema"] = +0.3
+    elif price < ema20 < ema50 < ema200: scores["ema"] = -1.0
+    elif price < ema20 < ema50:          scores["ema"] = -0.6
+    elif price < ema20:                  scores["ema"] = -0.3
+    else:                                scores["ema"] = 0.0
+
+    composite = float(np.mean(list(scores.values())))
+    return {
+        "score":           round(composite, 3),
+        "rsi":             round(float(rsi), 1),
+        "rsi_score":       scores["rsi"],
+        "macd_score":      scores["macd"],
+        "ema_score":       scores["ema"],
+        "macd_cross_bull": macd_cross_bull,
+        "macd_cross_bear": macd_cross_bear,
+        "price":           round(float(row["Close"]), 2),
+        "ema20":           round(float(ema20), 2),
+        "ema50":           round(float(ema50), 2),
+        "ema200":          round(float(ema200), 2),
+        "atr":             round(float(row["atr"]), 2),
+        "high":            round(float(row["High"]), 2),
+        "low":             round(float(row["Low"]), 2),
+        "volume":          int(row["Volume"]),
+    }
+
+
+def get_confluence(tf_scores: dict) -> float:
+    weighted_sum = sum(
+        data["score"] * TIMEFRAMES[tf]["weight"]
+        for tf, data in tf_scores.items()
+    )
+    total_weight = sum(TIMEFRAMES[tf]["weight"] for tf in tf_scores)
+    return round(weighted_sum / total_weight, 3) if total_weight else 0.0
+
+
+def classify_score(score: float) -> tuple[str, str]:
+    if score >= CONFLUENCE_THRESHOLD:
+        return "BUY", "🟢"
+    elif score <= -CONFLUENCE_THRESHOLD:
+        return "SELL", "🔴"
+    return "HOLD", "🟡"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RISK MANAGEMENT ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_risk_params(entry: float, atr: float, signal: str) -> dict:
+    sl_distance  = round(atr * ATR_SL_MULT, 2)
+    tp2_distance = round(sl_distance * MIN_RR, 2)
+
+    if signal == "BUY":
+        sl  = round(entry - sl_distance, 2)
+        tp1 = round(entry + sl_distance, 2)
+        tp2 = round(entry + tp2_distance, 2)
+    elif signal == "SELL":
+        sl  = round(entry + sl_distance, 2)
+        tp1 = round(entry - sl_distance, 2)
+        tp2 = round(entry - tp2_distance, 2)
+    else:
+        sl = tp1 = tp2 = entry
+
+    risk_usd      = ACCOUNT_SIZE * RISK_PCT
+    position_size = round(risk_usd / sl_distance, 4) if sl_distance > 0 else 0.0
+
+    return {
+        "entry":         entry,
+        "sl":            sl,
+        "tp1":           tp1,
+        "tp2":           tp2,
+        "sl_distance":   sl_distance,
+        "tp2_distance":  tp2_distance,
+        "rr_ratio":      round(tp2_distance / sl_distance, 1) if sl_distance else 0,
+        "risk_usd":      round(risk_usd, 2),
+        "position_size": position_size,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI INTERFACE  (OpenRouter — free-tier fallback chain)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def call_openrouter(prompt: str) -> str:
+    url     = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+    }
+    for model in OPENROUTER_MODELS:
+        payload = {"model": model,
+                   "messages": [{"role": "user", "content": prompt}]}
+        for attempt in range(1, 3):
+            try:
+                r      = requests.post(url, json=payload, headers=headers, timeout=60)
+                result = r.json()
+                if "choices" in result:
+                    log.info(f"AI answered via: {model}")
+                    return result["choices"][0]["message"]["content"]
+                error = result.get("error", {})
+                if error.get("code") == 429:
+                    wait = error.get("metadata", {}).get("retry_after_seconds", 20)
+                    log.warning(f"Rate-limited ({model}), retry in {wait}s [{attempt}/2]")
+                    time.sleep(wait + 2)
+                else:
+                    log.warning(f"Error ({model}): {error.get('message')} → next model")
+                    break
+            except Exception as e:
+                log.warning(f"Connection error ({model}): {e}")
+                time.sleep(10)
+    return "سمح لي، وقع خطأ ف الاتصال بالـ AI."
+
+
+def score_news_sentiment(news: str) -> float:
+    if not news:
+        return 0.0
+    prompt = (
+        "You are a quantitative analyst specializing in Gold (XAUUSD). "
+        "Analyze the following news headlines and return ONLY a single decimal number "
+        "between -1.0 (strongly bearish for gold) and +1.0 (strongly bullish for gold). "
+        f"No explanation, just the number.\n\nHeadlines:\n{news}"
+    )
+    try:
+        raw = call_openrouter(prompt).strip()
+        val = float("".join(c for c in raw if c in "0123456789.-")[:6])
+        return max(-1.0, min(1.0, val))
+    except Exception:
+        return 0.0
+
+
+def generate_darija_analysis(
+    signal: str,
+    confluence: float,
+    sentiment: float,
+    risk: dict,
+    tf_scores: dict,
+    news: str,
+    calendar_events: list | None = None,
+) -> str:
+    tf_summary = "\n".join(
+        f"  - {tf}: score={v['score']:+.2f}, RSI={v['rsi']}, ATR={v['atr']}"
+        for tf, v in tf_scores.items()
+    )
+    calendar_block = format_calendar_for_prompt(calendar_events or [])
+
+    trap_warning = ""
+    if calendar_events:
+        now  = datetime.now(timezone.utc)
+        soon = [
+            ev["title"] for ev in calendar_events
+            if ev.get("date") and not ev.get("actual")
+            and abs(
+                (datetime.fromisoformat(ev["date"].replace("Z", "+00:00")) - now
+                 ).total_seconds()
+            ) <= 172_800
+        ]
+        if soon:
+            trap_warning = (
+                f"\n⚠️ تحذير: هناك أحداث اقتصادية كبرى خلال 48 ساعة القادمة: "
+                f"{', '.join(soon[:3])}. "
+                "ابحث عن فخاخ التقلب (volatility traps) ونقاط السيولة قبل الدخول.\n"
+            )
+
+    prompt = (
+        "أنت محلل كمي مؤسسي متخصص في الذهب (XAUUSD). "
+        "بناءً على التحليل الكمي الشامل التالي:\n\n"
+        f"الإشارة النهائية: {signal}\n"
+        f"درجة التقاطع (Confluence): {confluence:+.3f}\n"
+        f"تقييم الأخبار (Sentiment): {sentiment:+.3f}\n"
+        f"نقاط الدخول: Entry=${risk['entry']} | SL=${risk['sl']} "
+        f"| TP1=${risk['tp1']} | TP2=${risk['tp2']}\n"
+        f"نسبة R:R = 1:{risk['rr_ratio']}\n\n"
+        f"بيانات الأطر الزمنية:\n{tf_summary}\n\n"
+        f"آخر الأخبار:\n{news or 'لا توجد أخبار'}\n\n"
+        f"📅 الأجندة الاقتصادية القادمة (أحداث عالية التأثير):\n{calendar_block}\n"
+        f"{trap_warning}\n"
+        "اكتب فقرة تحليلية واضحة ومختصرة بالدارجة المغربية (3-5 جمل فقط) "
+        "تشرح سبب هذه الإشارة، وإذا كان هناك حدث اقتصادي قريب يمكن أن يخلق "
+        "فخ تقلب (volatility trap) أو نقطة سيولة خطيرة، فنبه عليه بوضوح. "
+        "لا تكرر الأرقام الموجودة في الرسالة، فقط اشرح السياق والمنطق والمخاطر الماكرو."
+    )
+    return call_openrouter(prompt)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MARKET UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_market_session() -> str:
+    h = datetime.now(timezone.utc).hour
+    if h >= 22 or h < 7:  return "آسيا 🌏"
+    if h < 12:            return "لندن 🇬🇧"
+    if h < 17:            return "نيويورك 🇺🇸"
+    return "أوروبا 🌍"
+
+
+def is_weekend() -> bool:
+    return datetime.now(timezone.utc).weekday() >= 5
+
+
+def get_live_price() -> float | None:
+    try:
+        df = yf.download(TICKER, period="2d", interval="5m",
+                         progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty:
+            return None
+        return round(float(df["Close"].dropna().iloc[-1]), 2)
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPORT BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def weekend_report() -> str:
+    now            = datetime.now(timezone.utc)
+    days_to_monday = (7 - now.weekday()) % 7 or 7
+    monday_open    = now.replace(hour=0, minute=5, second=0, microsecond=0) + timedelta(days=days_to_monday)
+    hours_left     = round((monday_open - now).total_seconds() / 3600, 1)
+    day_name       = "السبت" if now.weekday() == 5 else "الأحد"
+    return (
+        f"📅 *تقرير نهاية الأسبوع — الذهب (XAUUSD)*\n"
+        f"_{now.strftime('%Y-%m-%d %H:%M')} UTC_\n\n"
+        f"🔴 *السوق مغلق اليوم ({day_name})*\n\n"
+        "⏳ سيعاود السوق فتح أبوابه الاثنين الصباح.\n"
+        f"🕐 الوقت المتبقي حتى الافتتاح: `~{hours_left}` ساعة\n\n"
+        "💡 *استغل عطلة الأسبوع لـ:*\n"
+        "    • مراجعة إشارات الأسبوع الماضي\n"
+        "    • تحديد المستويات المهمة للأسبوع القادم\n"
+        "    • قراءة التقارير الاقتصادية القادمة\n\n"
+        "✅ سيُستأنف التحليل التلقائي مع فتح السوق يوم الاثنين.\n"
+        "_استخدم /help لمعرفة الأوامر المتاحة._"
+    )
+
+
+def build_friday_summary() -> str:
+    now = datetime.now(timezone.utc)
+    with stats_lock:
+        signals    = list(weekly_stats.get("signals", []))
+        week_start = weekly_stats.get("week_start", now.strftime("%Y-%m-%d"))
+
+    total = len(signals)
+    buys  = sum(1 for s in signals if s["signal"] == "BUY")
+    sells = sum(1 for s in signals if s["signal"] == "SELL")
+    holds = sum(1 for s in signals if s["signal"] == "HOLD")
+
+    if total == 0:
+        direction_label = "محايد ➡️"
+        direction_note  = "ما صدرت أي إشارات هذا الأسبوع."
+        avg_score       = 0.0
+    else:
+        avg_score = round(sum(s["score"] for s in signals) / total, 3)
+        if avg_score >= 0.25:
+            direction_label = "صاعد 📈"
+            direction_note  = "الإشارات الأسبوعية مالت نحو الشراء."
+        elif avg_score <= -0.25:
+            direction_label = "هابط 📉"
+            direction_note  = "الإشارات الأسبوعية مالت نحو البيع."
+        else:
+            direction_label = "محايد ➡️"
+            direction_note  = "الإشارات الأسبوعية كانت متوازنة."
+
+    log_lines = ""
+    for s in signals[-10:]:
+        emoji = "🟢" if s["signal"] == "BUY" else "🔴" if s["signal"] == "SELL" else "🟡"
+        log_lines += f"    {emoji} {s['ts']} — {s['signal']} (`{s['score']:+.3f}`)\n"
+    if not log_lines:
+        log_lines = "    _لا توجد إشارات مسجلة_\n"
+
+    week_end = (datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=4)).strftime("%Y-%m-%d")
+    return (
+        f"📊 *ملخص أسبوع التداول — الذهب (XAUUSD)* 📊\n"
+        f"_{week_start} → {week_end}_\n\n"
+        f"🧭 *التوجه العام للأسبوع:* {direction_label}\n"
+        f"📝 {direction_note}\n\n"
+        "📈 *إحصائيات الإشارات:*\n"
+        f"    • إجمالي الإشارات: `{total}`\n"
+        f"    • 🟢 BUY:  `{buys}`\n"
+        f"    • 🔴 SELL: `{sells}`\n"
+        f"    • 🟡 HOLD: `{holds}`\n"
+        f"    • متوسط درجة التقاطع: `{avg_score:+.3f}`\n\n"
+        f"🕐 *آخر الإشارات هذا الأسبوع:*\n{log_lines}\n"
+        "🔴 *السوق سيُغلق بعد قليل.* أتمنى لك أسبوعاً موفقاً! 🤲\n"
+        "✅ سيُستأنف التحليل الاثنين مع فتح السوق.\n\n"
+        "_استخدم /help لقائمة الأوامر المتاحة._"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ANALYSIS PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_full_analysis() -> str:
+    if is_weekend():
+        log.info("Weekend — market closed.")
+        return weekend_report()
+
+    log.info("=" * 55)
+    log.info(f"ANALYSIS RUN — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info("=" * 55)
+
+    log.info("[1/5] Fetching multi-timeframe data...")
+    tf_scores: dict = {}
+    for tf, cfg in TIMEFRAMES.items():
+        df = fetch_timeframe(cfg["period"], cfg["interval"])
+        if df is not None:
+            tf_scores[tf] = score_timeframe(df)
+            sc = tf_scores[tf]
+            log.info(f"  {tf}: score={sc['score']:+.3f} | RSI={sc['rsi']} | ATR={sc['atr']}")
+        else:
+            log.warning(f"  {tf}: FAILED")
+
+    if not tf_scores:
+        return "سمح لي، فشل جلب البيانات من السوق. حاول مرة أخرى."
+
+    log.info("[2/5] Computing technical confluence...")
+    confluence = get_confluence(tf_scores)
+    tech_signal, _ = classify_score(confluence)
+    log.info(f"  Confluence = {confluence:+.3f} → {tech_signal}")
+
+    log.info("[3/5] Fetching news, sentiment & economic calendar...")
+    news            = fetch_news()
+    sentiment_score = score_news_sentiment(news)
+    calendar_events = fetch_economic_calendar()
+    log.info(f"  Sentiment = {sentiment_score:+.3f} | Calendar events: {len(calendar_events)}")
+
+    composite      = round(confluence * 0.75 + sentiment_score * 0.25, 3)
+    final_signal, signal_emoji = classify_score(composite)
+    confidence_pct = min(100, round(abs(composite) / 1.0 * 100, 1))
+    log.info(f"  Composite = {composite:+.3f} → {final_signal} ({confidence_pct}%)")
+    record_signal(final_signal, composite)
+
+    log.info("[4/5] Calculating risk parameters...")
+    ref_tf = "1h" if "1h" in tf_scores else list(tf_scores.keys())[-1]
+    entry  = tf_scores[ref_tf]["price"]
+    atr_1h = tf_scores[ref_tf]["atr"]
+    risk   = calc_risk_params(entry, atr_1h, final_signal)
+    log.info(f"  Entry=${entry} | SL=${risk['sl']} | TP2=${risk['tp2']} | R:R=1:{risk['rr_ratio']}")
+
+    log.info("[5/5] Generating Arabic analysis...")
+    analysis = generate_darija_analysis(
+        final_signal, composite, sentiment_score,
+        risk, tf_scores, news,
+        calendar_events=calendar_events,
+    )
+
+    ref   = tf_scores[ref_tf]
+    s_ema = ref["ema_score"]
+
+    ema_label = (
+        "السعر فوق EMA20/50/200
